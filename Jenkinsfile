@@ -1,14 +1,6 @@
 pipeline {
   agent any
 
-  parameters {
-    choice(
-      name: 'DEPLOY_ENV',
-      choices: ['staging', 'prod'],
-      description: 'Which environment to deploy to'
-    )
-  }
-
   environment {
     BUN_INSTALL = "${HOME}/.bun"
     PATH        = "${BUN_INSTALL}/bin:${PATH}"
@@ -18,15 +10,13 @@ pipeline {
   }
 
   options {
-    // Add timestamps to console output
     timestamps()
-    // Don’t allow overlapping runs
     disableConcurrentBuilds()
   }
 
   triggers {
-    // Reuse AP-07 behavior: poll SCM every 5 minutes
-    // (GitHub webhooks can also be enabled in the job config)
+    // Poll SCM every 5 minutes; each Jenkins job will be configured
+    // with its own branch (staging vs main).
     pollSCM('H/5 * * * *')
   }
 
@@ -38,9 +28,31 @@ pipeline {
           set -euo pipefail
           pwd
           echo "Workspace: $(pwd)"
-          echo "Git branch:"
+          echo "Git branch (from git):"
           git rev-parse --abbrev-ref HEAD || echo "detached HEAD"
         '''
+      }
+    }
+
+    stage('Determine target environment from branch') {
+      steps {
+        script {
+          def branch = sh(
+            script: "git rev-parse --abbrev-ref HEAD",
+            returnStdout: true
+          ).trim()
+
+          echo "Git branch detected: ${branch}"
+
+          if (branch == 'main') {
+            env.DEPLOY_ENV = 'prod'
+          } else {
+            // Default everything else (staging branch, feature branches, etc.) to staging
+            env.DEPLOY_ENV = 'staging'
+          }
+
+          echo "Using DEPLOY_ENV=${env.DEPLOY_ENV}"
+        }
       }
     }
 
@@ -119,7 +131,7 @@ EOF
 
     stage('Pre-deploy backup (prod only)') {
       when {
-        expression { params.DEPLOY_ENV == 'prod' }
+        expression { env.DEPLOY_ENV == 'prod' }
       }
       steps {
         sh '''
@@ -133,20 +145,20 @@ EOF
     stage('Deploy to target environment') {
       steps {
         script {
-          if (params.DEPLOY_ENV == 'staging') {
+          if (env.DEPLOY_ENV == 'staging') {
             sh '''
               set -euo pipefail
-              echo "Deploying to staging via staging-app..."
+              echo "Deploying to STAGING via staging-app..."
               ssh staging-app "cd /opt/activepieces && ./scripts/deploy-staging.sh"
             '''
-          } else if (params.DEPLOY_ENV == 'prod') {
+          } else if (env.DEPLOY_ENV == 'prod') {
             sh '''
               set -euo pipefail
-              echo "Deploying to prod via prod-app..."
+              echo "Deploying to PROD via prod-app..."
               ssh prod-app "cd /opt/activepieces && ./scripts/deploy-prod.sh"
             '''
           } else {
-            error "Unknown DEPLOY_ENV: ${params.DEPLOY_ENV}"
+            error "Unknown DEPLOY_ENV: ${env.DEPLOY_ENV}"
           }
         }
       }
@@ -155,7 +167,7 @@ EOF
     stage('Post-deploy health check') {
       steps {
         script {
-          def url = (params.DEPLOY_ENV == 'staging') ? env.STAGING_URL : env.PROD_URL
+          def url = (env.DEPLOY_ENV == 'staging') ? env.STAGING_URL : env.PROD_URL
 
           sh """
             set -euo pipefail
@@ -168,7 +180,7 @@ EOF
 
     stage('Rollback if unhealthy (prod only)') {
       when {
-        expression { params.DEPLOY_ENV == 'prod' }
+        expression { env.DEPLOY_ENV == 'prod' }
       }
       steps {
         script {
@@ -200,7 +212,7 @@ EOF
   post {
     success {
       script {
-        def envLabel = params.DEPLOY_ENV
+        def envLabel = env.DEPLOY_ENV ?: 'unknown'
         echo "✅ Activepieces ${envLabel} pipeline completed successfully."
 
         if (env.SLACK_WEBHOOK_URL) {
@@ -218,7 +230,7 @@ EOF
 
     failure {
       script {
-        def envLabel = params.DEPLOY_ENV
+        def envLabel = env.DEPLOY_ENV ?: 'unknown'
         echo "❌ Activepieces ${envLabel} pipeline FAILED – check stages above."
 
         if (env.SLACK_WEBHOOK_URL) {
@@ -235,3 +247,4 @@ EOF
     }
   }
 }
+
