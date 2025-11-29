@@ -8,12 +8,12 @@ pipeline {
 
   environment {
     // Staging deployment target
-    STAGING_HOST         = '10.10.0.20'
-    STAGING_USER         = 'tjjavelosa'
+    STAGING_HOST          = '10.10.0.20'
+    STAGING_USER          = 'tjjavelosa'
     STAGING_DEPLOY_SCRIPT = '/opt/activepieces/scripts/deploy-staging.sh'
 
     // Trivy severity threshold: fail build on CRITICAL vulns
-    TRIVY_SEVERITY       = 'CRITICAL'
+    TRIVY_SEVERITY        = 'CRITICAL'
   }
 
   stages {
@@ -67,7 +67,8 @@ class StrictVersion:
         return f"StrictVersion({self.version!r})"
 PY
 
-          export PYTHONPATH="$(pwd)/.jenkins-python-hacks:$PYTHONPATH"
+          # Safely set PYTHONPATH even if it was previously unset
+          export PYTHONPATH="$(pwd)/.jenkins-python-hacks:${PYTHONPATH:-}"
           export PYTHON="/usr/bin/python3"
 
           echo "Python version used by node-gyp:"
@@ -94,7 +95,7 @@ PY
       }
     }
 
-    stage('Vulnerability scan (Trivy filesystem))') {
+    stage('Vulnerability scan (Trivy filesystem)') {
       steps {
         sh '''
           set -euo pipefail
