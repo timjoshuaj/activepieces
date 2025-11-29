@@ -1,19 +1,33 @@
 pipeline {
   agent any
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
+  parameters {
+    choice(
+      name: 'DEPLOY_ENV',
+      choices: ['staging', 'prod'],
+      description: 'Which environment to deploy to'
+    )
   }
 
   environment {
-    // Staging deployment target
-    STAGING_HOST          = '10.10.0.20'
-    STAGING_USER          = 'tjjavelosa'
-    STAGING_DEPLOY_SCRIPT = '/opt/activepieces/scripts/deploy-staging.sh'
+    BUN_INSTALL = "${HOME}/.bun"
+    PATH        = "${BUN_INSTALL}/bin:${PATH}"
 
-    // Trivy severity threshold: fail build on CRITICAL vulns
-    TRIVY_SEVERITY        = 'CRITICAL'
+    STAGING_URL = 'https://activepieces.staging.officesphere.ai'
+    PROD_URL    = 'https://activepieces.app.officesphere.ai'
+  }
+
+  options {
+    // Add timestamps to console output
+    timestamps()
+    // Don’t allow overlapping runs
+    disableConcurrentBuilds()
+  }
+
+  triggers {
+    // Reuse AP-07 behavior: poll SCM every 5 minutes
+    // (GitHub webhooks can also be enabled in the job config)
+    pollSCM('H/5 * * * *')
   }
 
   stages {
@@ -21,9 +35,11 @@ pipeline {
       steps {
         checkout scm
         sh '''
+          set -euo pipefail
+          pwd
           echo "Workspace: $(pwd)"
           echo "Git branch:"
-          git rev-parse --abbrev-ref HEAD || true
+          git rev-parse --abbrev-ref HEAD || echo "detached HEAD"
         '''
       }
     }
@@ -34,46 +50,33 @@ pipeline {
           set -euo pipefail
 
           echo "Bun version:"
-          bun --version || { echo "bun not found in PATH"; exit 1; }
+          bun --version
 
           echo "Setting up Python distutils shim for node-gyp..."
           mkdir -p .jenkins-python-hacks/distutils
 
-          cat > .jenkins-python-hacks/distutils/__init__.py << 'PY'
-from .version import StrictVersion
-PY
+          cat > .jenkins-python-hacks/distutils/__init__.py << 'EOF'
+import importlib, types
+_real_distutils = importlib.import_module('setuptools._distutils')
+globals().update({k: v for k, v in _real_distutils.__dict__.items() if not k.startswith('_')})
+EOF
 
-          cat > .jenkins-python-hacks/distutils/version.py << 'PY'
-import re
+          cat > .jenkins-python-hacks/sitecustomize.py << 'EOF'
+import importlib, sys
+if 'distutils' not in sys.modules:
+    import setuptools._distutils as distutils
+    sys.modules['distutils'] = distutils
+EOF
 
-class StrictVersion:
-    def __init__(self, v):
-        self.version = str(v)
-        self._parts = tuple(int(x) for x in re.findall(r"\\d+", self.version))
-
-    def _cmp(self, other):
-        if not isinstance(other, StrictVersion):
-            other = StrictVersion(other)
-        return (self._parts > other._parts) - (self._parts < other._parts)
-
-    def __lt__(self, other): return self._cmp(other) < 0
-    def __le__(self, other): return self._cmp(other) <= 0
-    def __eq__(self, other): return self._cmp(other) == 0
-    def __ne__(self, other): return self._cmp(other) != 0
-    def __gt__(self, other): return self._cmp(other) > 0
-    def __ge__(self, other): return self._cmp(other) >= 0
-
-    def __repr__(self):
-        return f"StrictVersion({self.version!r})"
-PY
-
-          # Safely set PYTHONPATH even if it was previously unset
           export PYTHONPATH="$(pwd)/.jenkins-python-hacks:${PYTHONPATH:-}"
-          export PYTHON="/usr/bin/python3"
+          export PYTHON=/usr/bin/python3
 
           echo "Python version used by node-gyp:"
-          python3 --version || true
-          python3 -c "import distutils, distutils.version; print('distutils shim OK:', distutils.version.StrictVersion('1.0'))"
+          python3 --version
+          python3 - << 'EOF'
+import distutils, distutils.version
+print("distutils shim OK:", distutils.version.StrictVersion("1.0"))
+EOF
 
           echo "Installing dependencies with bun..."
           bun install
@@ -85,11 +88,8 @@ PY
       steps {
         sh '''
           set -euo pipefail
-
           echo "Running focused unit tests (engine helpers only)..."
           echo "You can expand this list later as CI env is hardened."
-
-          # Only run tests that do NOT require DB/Redis/dev pieces
           bun test packages/engine/test/helper
         '''
       }
@@ -99,11 +99,16 @@ PY
       steps {
         sh '''
           set -euo pipefail
-
           echo "Running Trivy filesystem scan..."
+
+          if ! command -v trivy >/dev/null 2>&1; then
+            echo "ERROR: trivy is not installed on this Jenkins agent."
+            exit 1
+          fi
+
           trivy fs \
             --exit-code 1 \
-            --severity "$TRIVY_SEVERITY" \
+            --severity HIGH,CRITICAL \
             --ignore-unfixed \
             --scanners vuln \
             --no-progress \
@@ -112,16 +117,81 @@ PY
       }
     }
 
-    stage('Deploy to staging (SSH → deploy-staging.sh)') {
+    stage('Pre-deploy backup (prod only)') {
+      when {
+        expression { params.DEPLOY_ENV == 'prod' }
+      }
       steps {
-        sshagent(credentials: ['ap-staging-ssh']) {
-          sh '''
-            set -euo pipefail
+        sh '''
+          set -euo pipefail
+          echo "Running pre-deploy Postgres backup on prod-db..."
+          ssh prod-db "sudo /usr/local/sbin/pgbackup-activepieces.sh"
+        '''
+      }
+    }
 
-            echo "Deploying to staging via SSH..."
-            ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$STAGING_USER@$STAGING_HOST" \
-              "$STAGING_DEPLOY_SCRIPT"
-          '''
+    stage('Deploy to target environment') {
+      steps {
+        script {
+          if (params.DEPLOY_ENV == 'staging') {
+            sh '''
+              set -euo pipefail
+              echo "Deploying to staging via staging-app..."
+              ssh staging-app "cd /opt/activepieces && ./scripts/deploy-staging.sh"
+            '''
+          } else if (params.DEPLOY_ENV == 'prod') {
+            sh '''
+              set -euo pipefail
+              echo "Deploying to prod via prod-app..."
+              ssh prod-app "cd /opt/activepieces && ./scripts/deploy-prod.sh"
+            '''
+          } else {
+            error "Unknown DEPLOY_ENV: ${params.DEPLOY_ENV}"
+          }
+        }
+      }
+    }
+
+    stage('Post-deploy health check') {
+      steps {
+        script {
+          def url = (params.DEPLOY_ENV == 'staging') ? env.STAGING_URL : env.PROD_URL
+
+          sh """
+            set -euo pipefail
+            echo "Running post-deploy health check against ${url}..."
+            curl -k --fail --max-time 10 -I "${url}" | head -n 10
+          """
+        }
+      }
+    }
+
+    stage('Rollback if unhealthy (prod only)') {
+      when {
+        expression { params.DEPLOY_ENV == 'prod' }
+      }
+      steps {
+        script {
+          // Re-check health but don't immediately fail the shell before rollback
+          def status = sh(
+            script: '''
+              set +e
+              curl -k --max-time 10 -I "https://activepieces.app.officesphere.ai" >/dev/null 2>&1
+              echo $?
+            ''',
+            returnStdout: true
+          ).trim()
+
+          if (status != '0') {
+            echo "Post-deploy health check FAILED, invoking rollback on prod..."
+            sh '''
+              set -euo pipefail
+              ssh prod-app "cd /opt/activepieces && ./scripts/rollback-prod.sh"
+            '''
+            error("Prod deployment rolled back due to failed health check.")
+          } else {
+            echo "Prod health OK, no rollback required."
+          }
         }
       }
     }
@@ -129,10 +199,39 @@ PY
 
   post {
     success {
-      echo '✅ Staging CI/CD pipeline completed successfully.'
+      script {
+        def envLabel = params.DEPLOY_ENV
+        echo "✅ Activepieces ${envLabel} pipeline completed successfully."
+
+        if (env.SLACK_WEBHOOK_URL) {
+          sh """
+            set -euo pipefail
+            curl -X POST -H 'Content-type: application/json' \
+              --data '{ "text": "✅ Activepieces ${envLabel} deployment succeeded: ${env.JOB_NAME} #${env.BUILD_NUMBER}" }' \
+              "${env.SLACK_WEBHOOK_URL}"
+          """
+        } else {
+          echo "SLACK_WEBHOOK_URL not set; skipping Slack notification."
+        }
+      }
     }
+
     failure {
-      echo '❌ Staging CI/CD pipeline FAILED – check stages above.'
+      script {
+        def envLabel = params.DEPLOY_ENV
+        echo "❌ Activepieces ${envLabel} pipeline FAILED – check stages above."
+
+        if (env.SLACK_WEBHOOK_URL) {
+          sh """
+            set -euo pipefail
+            curl -X POST -H 'Content-type: application/json' \
+              --data '{ "text": "❌ Activepieces ${envLabel} deployment FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}" }' \
+              "${env.SLACK_WEBHOOK_URL}"
+          """
+        } else {
+          echo "SLACK_WEBHOOK_URL not set; skipping Slack notification."
+        }
+      }
     }
   }
 }
