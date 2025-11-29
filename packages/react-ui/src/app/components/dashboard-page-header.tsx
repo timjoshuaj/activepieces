@@ -23,10 +23,6 @@ export const DashboardPageHeader = ({
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-xl font-semibold">{title}</h1>
-            {/* New Officesphere staging badge */}
-            <span className="ml-1 text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-300">
-              Officesphere – Staging
-            </span>
             {beta && (
               <div className="flex items-center">
                 <BetaBadge />
