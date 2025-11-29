@@ -33,6 +33,45 @@ pipeline {
         sh '''
           echo "Bun version:"
           bun --version || { echo "bun not found in PATH"; exit 1; }
+
+          echo "Setting up Python distutils shim for node-gyp..."
+          mkdir -p .jenkins-python-hacks/distutils
+
+          cat > .jenkins-python-hacks/distutils/__init__.py << 'PY'
+from .version import StrictVersion
+PY
+
+          cat > .jenkins-python-hacks/distutils/version.py << 'PY'
+import re
+
+class StrictVersion:
+    def __init__(self, v):
+        self.version = str(v)
+        self._parts = tuple(int(x) for x in re.findall(r"\\d+", self.version))
+
+    def _cmp(self, other):
+        if not isinstance(other, StrictVersion):
+            other = StrictVersion(other)
+        return (self._parts > other._parts) - (self._parts < other._parts)
+
+    def __lt__(self, other): return self._cmp(other) < 0
+    def __le__(self, other): return self._cmp(other) <= 0
+    def __eq__(self, other): return self._cmp(other) == 0
+    def __ne__(self, other): return self._cmp(other) != 0
+    def __gt__(self, other): return self._cmp(other) > 0
+    def __ge__(self, other): return self._cmp(other) >= 0
+
+    def __repr__(self):
+        return f"StrictVersion({self.version!r})"
+PY
+
+          export PYTHONPATH="$(pwd)/.jenkins-python-hacks:$PYTHONPATH"
+          export PYTHON="/usr/bin/python3"
+
+          echo "Python version used by node-gyp:"
+          python3 --version || true
+          python3 -c "import distutils, distutils.version; print('distutils shim OK:', distutils.version.StrictVersion('1.0'))"
+
           echo "Installing dependencies with bun..."
           bun install
         '''
