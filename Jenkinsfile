@@ -3,7 +3,6 @@ pipeline {
 
   options {
     timestamps()
-    ansiColor('xterm')
     disableConcurrentBuilds()
   }
 
@@ -24,7 +23,7 @@ pipeline {
         sh '''
           echo "Workspace: $(pwd)"
           echo "Git branch:"
-          git rev-parse --abbrev-ref HEAD
+          git rev-parse --abbrev-ref HEAD || true
         '''
       }
     }
@@ -43,7 +42,7 @@ pipeline {
     stage('Unit / integration tests') {
       steps {
         sh '''
-          echo "Running tests via bun test (replace with Nx/Jest later if desired)..."
+          echo "Running tests via bun test (we can tune this later)..."
           bun test
         '''
       }
